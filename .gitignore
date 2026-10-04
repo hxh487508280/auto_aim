@@ -1,0 +1,7 @@
+build/
+install/
+log/
+*.tar.gz
+__pycache__/
+*.pyc
+core

@@ -1,0 +1,10 @@
+auto_aim_node:
+  ros__parameters:
+    image_topic: "/image_raw"
+    image_qos: "reliable"
+    serial_device: "auto"
+    input_is_rgb: true
+    fire_enabled: true
+    debug_enabled: true
+    corridor_clearance_px: 60.0
+    fire_period_s: 0.36
