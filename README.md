@@ -6,8 +6,8 @@ ROS 2 (Humble) 自瞄节点：订阅模拟器的 `/image_raw`（1152x648），�
 ## 运行
 
 ```bash
-./scripts/run_node.sh          # 看门狗方式启动节点
-# 然后自己打开 homework2026 并点击开始（节点先于游戏启动即可）
+./scripts/run_all.sh          # 启动节点
+# 然后启动游戏
 ```
 
 难度选择超大杯；种子留空则随机。参数见 `config/params.yaml`。
