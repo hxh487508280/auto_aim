@@ -632,7 +632,7 @@ void AutoAimNode::ProcessFrame(const cv::Mat& bgr, double stamp_sec) {
   std::vector<PlateState> obstacles;  // friendlies + husks block bullets
   const auto& tracks = tracker_.tracks();
   for (const auto& track : tracks) {
-    PlateState state = PlateTracker::FitState(
+    PlateState state = PlateTracker::EstimateState(
         track, stamp_sec, 2.0F * game::kMaxPlateAccelPxS2);
     if (!state.valid) {
       continue;
