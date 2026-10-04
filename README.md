@@ -16,6 +16,6 @@ ROS 2 (Humble) 自瞄节点：订阅模拟器的 `/image_raw`（1152x648），�
 
 - `src/auto_aim_node.cpp` — 控制核心：检测→跟踪→拦截→开火时序→串口。
 - `src/armor_detector.cpp` — 红/蓝光柱 + 灰色残骸检测，炮台配色识别。
-- `src/plate_tracker.cpp` — 最近邻关联 + 稳健二次拟合（运动状态）。
+- `src/plate_tracker.cpp` — 最近邻关联 + 常加速度卡尔曼滤波（运动状态）。
 - `src/aim_solver.cpp` — 精确拦截求解、离场时间、弹道走廊检查。
 - `src/serial_controller.cpp` — pty 自动探测与串口协议。

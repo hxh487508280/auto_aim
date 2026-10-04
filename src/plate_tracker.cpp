@@ -5,6 +5,86 @@
 
 namespace auto_aim {
 
+namespace {
+
+using Cov3 = std::array<float, 9>;  // row-major symmetric 3x3
+
+// Init variances for the seeded filter: a two-point velocity at 60 fps
+// carries ~90 px/s of centroid noise, and acceleration is unknown when
+// the filter is seeded.
+constexpr float kInitPosVar = 16.0F;     // (4 px)^2
+constexpr float kInitVelVar = 14400.0F;  // (120 px/s)^2
+constexpr float kInitAccVar = 16900.0F;  // (130 px/s^2)^2
+
+Cov3 Mat3Mul(const Cov3& a, const Cov3& b) {
+  Cov3 out{};
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      float sum = 0.0F;
+      for (int k = 0; k < 3; ++k) {
+        sum += a[static_cast<size_t>(r) * 3 + k] *
+               b[static_cast<size_t>(k) * 3 + c];
+      }
+      out[static_cast<size_t>(r) * 3 + c] = sum;
+    }
+  }
+  return out;
+}
+
+// Standard KF predict: x = F x, P = F P F^T + Q. The process model is CA
+// with piecewise-white jerk noise, Q = sigma_j^2 G G^T where
+// G = [dt^3/6, dt^2/2, dt]^T. Mutates the track's filter.
+void KfPredictTo(TrackedPlate& t, double stamp, float jerk_std) {
+  const float dt = static_cast<float>(stamp - t.kf_stamp);
+  if (dt <= 0.0F) {
+    return;
+  }
+  const float dt2 = dt * dt;
+  t.kf_p += t.kf_v * dt + 0.5F * t.kf_a * dt2;
+  t.kf_v += t.kf_a * dt;
+  const Cov3 f = {1.0F, dt, 0.5F * dt2,
+                  0.0F, 1.0F, dt,
+                  0.0F, 0.0F, 1.0F};
+  const Cov3 f_transposed = {1.0F, 0.0F, 0.0F,
+                             dt, 1.0F, 0.0F,
+                             0.5F * dt2, dt, 1.0F};
+  const float g[3] = {dt2 * dt / 6.0F, dt2 / 2.0F, dt};
+  Cov3 q{};
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      q[static_cast<size_t>(r) * 3 + c] = jerk_std * jerk_std * g[r] * g[c];
+    }
+  }
+  t.kf_cov = Mat3Mul(Mat3Mul(f, t.kf_cov), f_transposed);
+  for (size_t i = 0; i < t.kf_cov.size(); ++i) {
+    t.kf_cov[i] += q[i];
+  }
+  t.kf_stamp = stamp;
+}
+
+// Standard KF update for a position-only measurement, H = [1 0 0].
+void KfUpdateWith(TrackedPlate& t, float z, float meas_std) {
+  const float s = t.kf_cov[0] + meas_std * meas_std;
+  if (s < 1e-9F) {
+    return;
+  }
+  const float gain[3] = {t.kf_cov[0] / s, t.kf_cov[3] / s, t.kf_cov[6] / s};
+  const float innovation = z - t.kf_p;
+  t.kf_p += gain[0] * innovation;
+  t.kf_v += gain[1] * innovation;
+  t.kf_a += gain[2] * innovation;
+  Cov3 cov = t.kf_cov;
+  for (int j = 0; j < 3; ++j) {
+    const size_t col = static_cast<size_t>(j);
+    cov[col] -= gain[0] * t.kf_cov[col];
+    cov[3 + col] -= gain[1] * t.kf_cov[col];
+    cov[6 + col] -= gain[2] * t.kf_cov[col];
+  }
+  t.kf_cov = cov;
+}
+
+}  // namespace
+
 PlateTracker::PlateTracker() : PlateTracker(Params{}) {}
 
 PlateTracker::PlateTracker(const Params& params) : params_(params) {}
@@ -36,9 +116,10 @@ void PlateTracker::Update(const std::vector<ArmorPlate>& detections,
                           double stamp_sec) {
   gone_.clear();
 
-  // Nearest-neighbour matching against each track's fitted position. At
-  // 60 fps a 700 px/s plate moves ~12 px per frame, so the gate mostly
-  // guards against mismatches; it scales with dt for low-fps regimes.
+  // Nearest-neighbour matching against each track's Kalman-predicted
+  // position. At 60 fps a 700 px/s plate moves ~12 px per frame, so the
+  // gate mostly guards against mismatches; it scales with dt for low-fps
+  // regimes.
   struct Pair {
     size_t track;
     size_t det;
@@ -52,7 +133,8 @@ void PlateTracker::Update(const std::vector<ArmorPlate>& detections,
     }
     const cv::Point2f last(t.history.back().x, t.history.back().y);
     const double dt = std::max(0.0, stamp_sec - t.last_stamp);
-    const PlateState st = FitState(t, stamp_sec, params_.max_accel_px_s2);
+    const PlateState st = EstimateState(t, stamp_sec,
+                                        params_.max_accel_px_s2);
     const cv::Point2f predicted = st.valid ? st.position : last;
     const float gate =
         params_.match_gate_px +
@@ -91,6 +173,33 @@ void PlateTracker::Update(const std::vector<ArmorPlate>& detections,
     } else if (!t.dead) {
       t.color = d.color;
     }
+    if (t.kf_init) {
+      KfPredictTo(t, stamp_sec, params_.kf_jerk_std_px_s3);
+      const float innovation = d.center.x - t.kf_p;
+      if (std::fabs(innovation) <= params_.kf_gate_px) {
+        KfUpdateWith(t, d.center.x, params_.kf_meas_noise_px);
+      }
+      // else: the detection is an outlier — a hit-flash bbox jump, not
+      // real motion (the old IRLS fit dropped exactly these samples).
+      // Keep the predicted state; it still serves association and aiming.
+      t.kf_a = std::clamp(t.kf_a, -params_.max_accel_px_s2,
+                          params_.max_accel_px_s2);
+    } else if (!t.history.empty()) {
+      // Seed from the two most recent samples: the same finite-difference
+      // velocity the old two-point linear warm-up produced.
+      const TrackedPlate::Sample& prev = t.history.back();
+      const double dt0 = stamp_sec - prev.stamp;
+      if (dt0 > 1e-3) {
+        t.kf_p = d.center.x;
+        t.kf_v = static_cast<float>((d.center.x - prev.x) / dt0);
+        t.kf_a = 0.0F;
+        t.kf_cov = {kInitPosVar, 0.0F, 0.0F,
+                    0.0F, kInitVelVar, 0.0F,
+                    0.0F, 0.0F, kInitAccVar};
+        t.kf_stamp = stamp_sec;
+        t.kf_init = true;
+      }
+    }
     t.history.push_back({stamp_sec, d.center.x, d.center.y});
     while (t.history.size() > params_.max_history ||
            (t.history.size() > 2 &&
@@ -114,8 +223,9 @@ void PlateTracker::Update(const std::vector<ArmorPlate>& detections,
     ++t.misses;
     if (t.misses == 1 && !t.history.empty()) {
       // Coast one frame so single-frame detection dropouts (the hit
-      // flash hides the light bars for ~0.2 s) do not break the fit.
-      const PlateState st = FitState(t, stamp_sec, params_.max_accel_px_s2);
+      // flash hides the light bars for ~0.2 s) do not break the state.
+      const PlateState st = EstimateState(t, stamp_sec,
+                                          params_.max_accel_px_s2);
       if (st.valid) {
         t.history.push_back({stamp_sec, st.position.x, st.position.y});
         while (t.history.size() > params_.max_history) {
@@ -151,12 +261,15 @@ void PlateTracker::Update(const std::vector<ArmorPlate>& detections,
   tracks_ = kept;
 }
 
-PlateState PlateTracker::FitState(const TrackedPlate& track,
-                                  double stamp_sec, float max_accel_px_s2) {
+PlateState PlateTracker::EstimateState(const TrackedPlate& track,
+                                       double stamp_sec,
+                                       float max_accel_px_s2) {
   PlateState out;
   out.stamp = stamp_sec;
   out.y = track.history.empty() ? 0.0F : track.history.back().y;
-  if (track.history.size() < 3) {
+  if (!track.kf_init) {
+    // Warm-up: with exactly two samples report a finite-difference
+    // velocity, matching the old two-point linear warm-up.
     if (track.history.size() == 2) {
       const double dt = track.history[1].stamp - track.history[0].stamp;
       if (dt > 1e-3) {
@@ -169,96 +282,16 @@ PlateState PlateTracker::FitState(const TrackedPlate& track,
     return out;
   }
 
-  // Robust least squares over (t - t_mid): x ≈ c0 + c1 t' + c2 t'^2.
-  // A plain LSQ lets a single detection glitch (a hit flash hides one
-  // light bar and the bbox centre jumps by half a plate) drag the fit so
-  // hard that the velocity swings by 100 px/s between frames — every
-  // shot then under/over-leads by half a plate. Two IRLS passes drop
-  // samples whose residual exceeds 8 px and refit; plate centroids are
-  // otherwise good to ~1 px. At most a third of the surviving samples is
-  // dropped per pass: plates entering the field are half visible and
-  // their centroid sits ~16 px off — dropping every such sample starved
-  // the fit below usability and froze the whole pipeline.
-  const double t_mid = stamp_sec;
-  int n = 0;
-  std::vector<char> keep(track.history.size(), 1);
-  double c0 = 0, c1 = 0, c2 = 0;
-  for (int pass = 0; pass < 3; ++pass) {
-    double s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
-    double b0 = 0, b1 = 0, b2 = 0;
-    n = 0;
-    for (size_t idx = 0; idx < track.history.size(); ++idx) {
-      if (!keep[idx]) continue;
-      const double u = track.history[idx].stamp - t_mid;
-      const double u2 = u * u;
-      const double x = track.history[idx].x;
-      s0 += 1; s1 += u; s2 += u2;
-      s3 += u * u2; s4 += u2 * u2;
-      b0 += x; b1 += x * u; b2 += x * u2;
-      ++n;
-    }
-    if (n < 4) return out;
-    const double det = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) +
-                       s2 * (s1 * s3 - s2 * s2);
-    if (std::fabs(det) < 1e-6) return out;
-    c0 = (b0 * (s2 * s4 - s3 * s3) - s1 * (b1 * s4 - s3 * b2) +
-          s2 * (b1 * s3 - s2 * b2)) / det;
-    c1 = (s0 * (b1 * s4 - s3 * b2) - b0 * (s1 * s4 - s3 * s2) +
-          s2 * (s1 * b2 - b1 * s2)) / det;
-    c2 = (s0 * (s2 * b2 - b1 * s2) - s1 * (s1 * b2 - b1 * s1) +
-          b0 * (s1 * s3 - s2 * s2)) / det;
-    if (pass == 2) break;
-    // Drop gross outliers for the next pass, but never more than a
-    // third of the surviving samples per pass: plates entering the field
-    // are half visible and their centroid sits ~16 px off — dropping
-    // every such sample starved the fit and froze the pipeline.
-    bool dropped = false;
-    size_t kept_now = 0;
-    for (size_t idx = 0; idx < track.history.size(); ++idx) {
-      if (keep[idx]) ++kept_now;
-    }
-    size_t drop_budget = kept_now / 3;
-    if (drop_budget == 0) break;
-    for (size_t idx = 0; idx < track.history.size() && drop_budget > 0;
-         ++idx) {
-      if (!keep[idx]) continue;
-      const double u = track.history[idx].stamp - t_mid;
-      const double pred = c0 + c1 * u + c2 * u * u;
-      if (std::fabs(pred - track.history[idx].x) > 8.0) {
-        keep[idx] = 0;
-        dropped = true;
-        --drop_budget;
-      }
-    }
-    if (!dropped) break;
-  }
-
-  // c2 is 0.5 * ax; reject accelerations the game cannot produce (the
-  // cap is +-100 px/s^2 in 超大杯) — those fits are detection glitches.
-  const float ax = static_cast<float>(2.0 * c2);
-  if (std::fabs(ax) > max_accel_px_s2) {
-    // Fall back to a linear fit through the first and last kept samples.
-    int first_i = -1, last_i = -1;
-    for (size_t idx = 0; idx < track.history.size(); ++idx) {
-      if (!keep[idx]) continue;
-      if (first_i < 0) first_i = static_cast<int>(idx);
-      last_i = static_cast<int>(idx);
-    }
-    if (first_i < 0) return out;
-    const double dt = track.history[last_i].stamp -
-                      track.history[first_i].stamp;
-    if (dt < 1e-3) return out;
-    out.valid = true;
-    out.position = cv::Point2f(track.history[last_i].x, out.y);
-    out.vx = static_cast<float>((track.history[last_i].x -
-                                 track.history[first_i].x) / dt);
-    out.ax = 0.0F;
-    return out;
-  }
+  // Extrapolate the stored Kalman state to the query time. The filter
+  // itself is never mutated here: the stored state always refers to
+  // kf_stamp, the last matched update.
+  const float dt = static_cast<float>(stamp_sec - track.kf_stamp);
   out.valid = true;
-  out.position = cv::Point2f(static_cast<float>(c0), out.y);
-  out.vx = static_cast<float>(c1);
-  out.ax = ax;
+  out.position = cv::Point2f(track.kf_p + track.kf_v * dt +
+                                 0.5F * track.kf_a * dt * dt,
+                             out.y);
+  out.vx = track.kf_v + track.kf_a * dt;
+  out.ax = std::clamp(track.kf_a, -max_accel_px_s2, max_accel_px_s2);
   return out;
 }
 
